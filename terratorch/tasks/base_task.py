@@ -23,16 +23,10 @@ class TerraTorchTask(BaseTask):
     tasks implemented in terratorch
     """
 
-    def __init__(
-        self, 
-        task: str | None = None, 
-        tiled_inference_on_testing: bool = False, 
-        tiled_inference_on_validation: bool = False, 
-        path_to_record_metrics: str = False):
+    def __init__(self, task: str | None = None, tiled_inference_on_testing: bool = False, path_to_record_metrics: str = False):
 
         self.task = task
         self.tiled_inference_on_testing = tiled_inference_on_testing
-        self.tiled_inference_on_validation = tiled_inference_on_validation
         self.path_to_record_metrics = path_to_record_metrics
 
         super().__init__()
@@ -64,11 +58,7 @@ class TerraTorchTask(BaseTask):
         if self.hparams["freeze_head"]:
             self.model.freeze_head()
 
-    def handle_full_or_tiled_inference(
-        self, 
-        x, 
-        use_tiled_inference:bool=False, 
-        **rest):
+    def handle_full_or_tiled_inference(self, x, num_categories:int=None, **rest):
 
         # When the input sample cannot be fit on memory for some reason
         # the tiled inference is automatically invoked.
@@ -81,17 +71,17 @@ class TerraTorchTask(BaseTask):
         else:
             device = "RAM"
 
-        if not use_tiled_inference:
-            # When the user don't set the variable `tiled_inference_on_testing` or `tiled_inference_on_validation`
+        if not self.tiled_inference_on_testing:
+            # When the user don't set the variable `tiled_inference_on_testing`
             # as `True` in the config, we will try to use full inference.
             try:
                 model_output: ModelOutput = self(x, **rest)
             except (torch.OutOfMemoryError, MemoryError)  as e:
-                raise Exception(f"Inference on testing failed due to insufficient {device}. Try to pass `tiled_inference_on_testing` or `tiled_inference_on_validation` as `True`, to use tiled inference for it.")
+                raise Exception(f"Inference on testing failed due to insufficient {device}. Try to pass `tiled_inference_on_testing` as `True`, to use tiled inference for it.")
 
         else:
-            logger.debug("Running tiled inference.")
-            logger.debug("Notice that the tiled inference WON'T produce the exactly same result as the full inference.")
+            logger.info("Running tiled inference.")
+            logger.info("Notice that the tiled inference WON'T produce the exactly same result as the full inference.")
             if self.tiled_inference_parameters:
                 # Even when tiled inference is chosen and we have a config
                 # defined for it, we can have a memory issue when this
@@ -145,16 +135,63 @@ class TerraTorchTask(BaseTask):
         )
 
     def on_train_epoch_end(self) -> None:
-        self.log_dict(self.train_metrics.compute(), sync_dist=True)
+        #self.log_dict(self.train_metrics.compute(), sync_dist=True)
+        
+        metric_dict = dict()
+        for metric_i in self.train_metrics:
+            
+            #ipdb.set_trace(context=25)
+            
+            metric_name = metric_i.split("/")[1]
+            metric_tensor = self.train_metrics[metric_name]
+            metric_tensor = metric_tensor.compute()
+            
+            if metric_name == "R2_Score":
+                metric_tensor = metric_tensor.mean()
+            metric_dict[metric_i] = metric_tensor
+        self.log_dict(metric_dict, sync_dist=True)
+        
         self.train_metrics.reset()
 
     def on_validation_epoch_end(self) -> None:
-        self.log_dict(self.val_metrics.compute(), sync_dist=True)
+        
+        #self.log_dict(self.val_metrics.compute(), sync_dist=True)
+        #import ipdb
+        metric_dict = dict()
+        for metric_i in self.val_metrics:
+            
+            #ipdb.set_trace(context=25)
+            
+            metric_name = metric_i.split("/")[1]
+            metric_tensor = self.val_metrics[metric_name]
+            metric_tensor = metric_tensor.compute()
+            
+            if metric_name == "R2_Score":
+                metric_tensor = metric_tensor.mean()
+            metric_dict[metric_i] = metric_tensor
+        self.log_dict(metric_dict, sync_dist=True)
         self.val_metrics.reset()
 
     def on_test_epoch_end(self) -> None:
+        
         for metrics in self.test_metrics:
-            self.log_dict(metrics.compute(), sync_dist=True)
+            metric_dict = dict()
+            for m_i in metrics:
+                #import ipdb
+                
+                metric_name = m_i.split("/")[1]
+                
+                #ipdb.set_trace(context=25)
+                
+                metric_tensor = metrics[metric_name]
+                metric_tensor = metric_tensor.compute()
+                
+                if metric_name == "R2_Score":
+                    metric_tensor = metric_tensor.mean()
+                metric_dict[m_i] = metric_tensor
+                
+            self.log_dict(metric_dict, sync_dist=True)
+            print(metric_dict)
             metrics.reset()
 
     def _do_plot_samples(self, batch_index):
