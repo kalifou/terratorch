@@ -12,10 +12,7 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback
 from torch import Tensor, nn
 from torchgeo.datasets.utils import unbind_samples
-from torchmetrics import MeanAbsoluteError, MeanSquaredError, MetricCollection #, R2Score
-
-from torcheval.metrics import R2Score
-
+from torchmetrics import MeanAbsoluteError, MeanSquaredError, MetricCollection, R2Score
 from torchmetrics.metric import Metric
 from torchmetrics.wrappers.abstract import WrapperMetric
 
@@ -163,7 +160,8 @@ class PixelwiseRegressionTask(TerraTorchTask):
         tiled_inference_parameters: dict | None = None,
         test_dataloaders_names: list[str] | None = None,
         lr_overrides: dict[str, float] | None = None,
-        tiled_inference_on_testing: bool = None,
+        tiled_inference_on_testing: bool = False,
+        tiled_inference_on_validation: bool = False,
         path_to_record_metrics: str = None,
     ) -> None:
         """Constructor
@@ -206,8 +204,8 @@ class PixelwiseRegressionTask(TerraTorchTask):
             lr_overrides (dict[str, float] | None, optional): Dictionary to override the default lr in specific
                 parameters. The key should be a substring of the parameter names (it will check the substring is
                 contained in the parameter name)and the value should be the new lr. Defaults to None.
-            tiled_inference_on_testing (bool): A boolean to the fine if tiled inference will be used when full inference
-                fails during the test step.
+            tiled_inference_on_testing (bool): A boolean to define if tiled inference will be used during the test step. 
+            tiled_inference_on_validation (bool): A boolean to define if tiled inference will be used during the val step. 
             path_to_record_metrics (str): A path to save the file containing the metrics log.
         """
 
@@ -223,8 +221,12 @@ class PixelwiseRegressionTask(TerraTorchTask):
         if model_factory and model is None:
             self.model_factory = MODEL_FACTORY_REGISTRY.build(model_factory)
 
-        super().__init__(task="regression", tiled_inference_on_testing=tiled_inference_on_testing,
-                         path_to_record_metrics=path_to_record_metrics)
+        super().__init__(
+            task="regression", 
+            tiled_inference_on_testing=tiled_inference_on_testing,
+            tiled_inference_on_validation=tiled_inference_on_validation,
+            path_to_record_metrics=path_to_record_metrics
+            )
 
         if model:
             # Custom_model
@@ -270,9 +272,8 @@ class PixelwiseRegressionTask(TerraTorchTask):
                 "RMSE": MeanSquaredError(squared=False),
                 "MSE": MeanSquaredError(squared=True),
                 "MAE": MeanAbsoluteError(),
-                "R2_Score": R2Score(multioutput="raw_values"),
+                "R2_Score": R2Score(),
             }
-        
 
         def wrap_metrics_with_ignore_index(metrics):
             return {
@@ -310,12 +311,7 @@ class PixelwiseRegressionTask(TerraTorchTask):
         loss = self.train_loss_handler.compute_loss(model_output, y, self.criterion, self.aux_loss)
         self.train_loss_handler.log_loss(self.log, loss_dict=loss, batch_size=y.shape[0])
         y_hat = model_output.output
-        
-        batch_size, img_height, img_width = y_hat.shape
-        for item_i in range(batch_size):
-            self.train_metrics.update(y_hat[item_i], y[item_i])
-            
-        #self.train_metrics.update(y_hat, y)
+        self.train_metrics.update(y_hat, y)
 
         return loss["loss"]
 
@@ -331,14 +327,13 @@ class PixelwiseRegressionTask(TerraTorchTask):
         y = batch["mask"]
         other_keys = batch.keys() - {"image", "mask", "filename"}
         rest = {k: batch[k] for k in other_keys}
-        model_output: ModelOutput = self(x, **rest)
+        #model_output: ModelOutput = self(x, **rest)
+        model_output = self.handle_full_or_tiled_inference(x, self.tiled_inference_on_validation, **rest)
+
         loss = self.val_loss_handler.compute_loss(model_output, y, self.criterion, self.aux_loss)
         self.val_loss_handler.log_loss(self.log, loss_dict=loss, batch_size=y.shape[0])
         y_hat = model_output.output
-        
-        batch_size, img_height, img_width = y_hat.shape
-        for item_i in range(batch_size):
-            self.val_metrics.update(y_hat[item_i], y[item_i])
+        self.val_metrics.update(y_hat, y)
 
         if self._do_plot_samples(batch_idx):
             try:
@@ -350,19 +345,15 @@ class PixelwiseRegressionTask(TerraTorchTask):
                 for key in ["image", "mask", "prediction"]:
                     batch[key] = batch[key].cpu()
                 sample = unbind_samples(batch)[0]
-                
-                #import ipdb
-                #ipdb.set_trace()
-                if not isinstance(datamodule.train_dataset, torch.utils.data.dataset.Subset):
-                    fig = datamodule.val_dataset.plot(sample)
-                    if fig:
-                        summary_writer = self.logger.experiment
-                        if hasattr(summary_writer, "add_figure"):
-                            summary_writer.add_figure(f"image/{batch_idx}", fig, global_step=self.global_step)
-                        elif hasattr(summary_writer, "log_figure"):
-                            summary_writer.log_figure(
-                                self.logger.run_id, fig, f"epoch_{self.current_epoch}_{batch_idx}.png"
-                            )
+                fig = datamodule.val_dataset.plot(sample)
+                if fig:
+                    summary_writer = self.logger.experiment
+                    if hasattr(summary_writer, "add_figure"):
+                        summary_writer.add_figure(f"image/{batch_idx}", fig, global_step=self.global_step)
+                    elif hasattr(summary_writer, "log_figure"):
+                        summary_writer.log_figure(
+                            self.logger.run_id, fig, f"epoch_{self.current_epoch}_{batch_idx}.png"
+                        )
             except ValueError:
                 pass
             finally:
@@ -381,7 +372,7 @@ class PixelwiseRegressionTask(TerraTorchTask):
         other_keys = batch.keys() - {"image", "mask", "filename"}
         rest = {k: batch[k] for k in other_keys}
 
-        model_output = self.handle_full_or_tiled_inference(x, 1, **rest)
+        model_output = self.handle_full_or_tiled_inference(x, self.tiled_inference_on_testing, **rest)
 
         if dataloader_idx >= len(self.test_loss_handler):
             msg = "You are returning more than one test dataloader but not defining enough test_dataloaders_names."
@@ -393,15 +384,7 @@ class PixelwiseRegressionTask(TerraTorchTask):
             batch_size=y.shape[0],
         )
         y_hat = model_output.output
-        #self.test_metrics[dataloader_idx].update(y_hat, y)
-        
-        batch_size, img_height, img_width = y_hat.shape
-        for item_i in range(batch_size):
-            self.test_metrics[dataloader_idx].update(y_hat[item_i], y[item_i])
-        
-        #import ipdb
-        #print("Test-set ==> Post metrics computing")
-        #ipdb.set_trace(context=25)
+        self.test_metrics[dataloader_idx].update(y_hat, y)
 
         self.record_metrics(dataloader_idx, y_hat, y)
 
